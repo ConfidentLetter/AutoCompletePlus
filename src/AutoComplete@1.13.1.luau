@@ -15,7 +15,7 @@ end
 
 local Types = require(script.Types)
 
-print("Running AutoComplete+ v1.13. View ROSS server for update info.")
+print("Running AutoComplete+ v1.13.1. View ROSS server for update info.")
 
 local pluginGlobalIndex: Types.pluginGlobalIndex = _G["AutoComplete+"]
 
@@ -127,10 +127,10 @@ for _, instance: Instance in CollectionService:GetTagged(IMPORTABLE_TAG) do
 	addItem(instance)
 end
 
-CollectionService:GetInstanceAddedSignal(NO_IMPORT_TAG):Connect(function(instance: Folder | ModuleScript)
+table.insert(pluginGlobalIndex.Connections, CollectionService:GetInstanceAddedSignal(NO_IMPORT_TAG):Connect(function(instance: Folder | ModuleScript)
 	registerNoImportInstance(instance)
-end)
-CollectionService:GetInstanceRemovedSignal(NO_IMPORT_TAG):Connect(function(instance: Folder | ModuleScript)
+end))
+table.insert(pluginGlobalIndex.Connections, CollectionService:GetInstanceRemovedSignal(NO_IMPORT_TAG):Connect(function(instance: Folder | ModuleScript)
 	if instance:IsA("Folder") then
 		local found = table.find(noImportFolders, instance)
 		if found then
@@ -145,21 +145,21 @@ CollectionService:GetInstanceRemovedSignal(NO_IMPORT_TAG):Connect(function(insta
 	elseif instance:IsA("ModuleScript") then
 		addItem(instance)
 	end
-end)
-CollectionService:GetInstanceAddedSignal(IMPORTABLE_TAG):Connect(function(instance: Instance)
+end))
+table.insert(pluginGlobalIndex.Connections, CollectionService:GetInstanceAddedSignal(IMPORTABLE_TAG):Connect(function(instance: Instance)
 	if instance:IsA("ModuleScript") then
 		return
 	end
 
 	addItem(instance)
-end)
-CollectionService:GetInstanceRemovedSignal(IMPORTABLE_TAG):Connect(function(instance: Instance)
+end))
+table.insert(pluginGlobalIndex.Connections, CollectionService:GetInstanceRemovedSignal(IMPORTABLE_TAG):Connect(function(instance: Instance)
 	if instance:IsA("ModuleScript") then
 		return
 	end
 
 	removeItem(instance)
-end)
+end))
 
 for _, origin in moduleScriptOrigins do
 	for _, moduleScript in origin:GetDescendants() do
@@ -462,104 +462,136 @@ pcall(function()
 	ScriptEditorService:DeregisterAutocompleteCallback("AutoComplete")
 end)
 ScriptEditorService:RegisterAutocompleteCallback("AutoComplete", 1, function(locator, existingSuggestions)
-	local start = os.clock()
-	
 	local document: ScriptDocument = locator.textDocument.document
 	if document:IsCommandBar() then return existingSuggestions end
 
 	local currentLine: string = document:GetText(locator.position.line, 1, locator.position.line, locator.position.character)
 
-	local suggestionCharacter = pluginGlobalIndex.SuggestionCharacter
-	local currentWordStart, currentWordEnd, currentWord
+	local suggestionCharacter: string? = pluginGlobalIndex.SuggestionCharacter
+	local currentWordStart: number?, currentWordEnd: number?, currentWord: string
 
 	if suggestionCharacter and suggestionCharacter ~= "" then
 		currentWordStart, currentWordEnd = string.find(currentLine, suggestionCharacter .. "([^" .. suggestionCharacter .. "]*)$")
-		if not currentWordEnd or locator.position.character <= currentWordEnd then return existingSuggestions end
+		if not currentWordEnd or locator.position.character <= currentWordEnd then
+			return existingSuggestions
+		end
 		currentWord = string.lower(string.sub(currentLine, currentWordStart :: number + 1, currentWordEnd))
 	else
 		currentWordStart, currentWordEnd = string.find(currentLine, "%w+$")
-		if not (currentWordStart and currentWordEnd) or #existingSuggestions.items == 0 then return existingSuggestions end
+		if not (currentWordStart and currentWordEnd) or #existingSuggestions.items == 0 then
+			return existingSuggestions
+		end
 
 		if currentWordStart > 1 then
 			local previousCharacter = string.sub(currentLine, currentWordStart - 1, currentWordStart - 1)
-			if previousCharacter ~= "(" and not string.find(previousCharacter, "%s") then return existingSuggestions end
+			if previousCharacter ~= "(" and not string.find(previousCharacter, "%s") then
+				return existingSuggestions
+			end
 		end
 
 		currentWord = string.lower(string.sub(currentLine, currentWordStart, currentWordEnd))
 	end
 
 	local currentWordLength: number = string.len(currentWord)
-
+	local documentLines: { string } = string.split(document:GetText(), "\n")
+	
 	-- Gather already imported
-	local alreadyImported: { string } = {}
-	for line, lineContents in string.split(document:GetText(), "\n") do
-		if line > MAXIMUM_LINES_TO_PARSE or line > locator.position.line :: number then break end
+	local alreadyImported: { [string]: number } = {}
+	for line, lineContents in documentLines do
+		if line > MAXIMUM_LINES_TO_PARSE or line > locator.position.line :: number then
+			break
+		end
 
-		local existingImport: string? = string.match(lineContents, '%(%s*"(.-)"%s*%)')
-		if existingImport then
-			table.insert(alreadyImported, string.lower(existingImport))
+		local serviceImport: string? = string.match(lineContents, '%(%s*"(.-)"%s*%)')
+		if serviceImport then
+			alreadyImported[string.lower(serviceImport)] = line
 		else
-			local decl = (string.find(lineContents, "local") or string.find(lineContents, "require")) 
-				and Transformers.getNameOfImportedItemFromDeclaration(lineContents)
-			if decl then table.insert(alreadyImported, decl) end
+			local moduleImport = string.find(lineContents, "require") and Transformers.getNameOfImportedItemFromDeclaration(lineContents)
+			if moduleImport then
+				local variableName = Transformers.getVariableNameFromLine(lineContents)
+				if variableName ~= moduleImport and string.find(variableName, "_") then
+					alreadyImported[variableName] = line
+				else
+					alreadyImported[moduleImport] = line
+				end
+				continue
+			end
+			
+			local instanceImport = string.find(lineContents, "local") and Transformers.getNameOfImportedItemFromDeclaration(lineContents)
+			if instanceImport then
+				alreadyImported[instanceImport] = line
+			end
 		end
 	end
 
-	local currentScript = locator.textDocument.script
+	local currentScript: LuaSourceContainer = locator.textDocument.script
 	local isInServerContext = currentScript:IsDescendantOf(ServerScriptService)
 		or currentScript:IsDescendantOf(ServerStorage)
 
-	duplicateModules = {}
-
 	-- Services
 	for lower_serviceName in services do
-		if string.find(lower_serviceName, currentWord) and not table.find(alreadyImported, lower_serviceName) then
+		if string.find(lower_serviceName, currentWord) and not alreadyImported[lower_serviceName] then
 			table.insert(existingSuggestions.items, generateAutoCompleteSuggestion(lower_serviceName, locator.position :: Types.subRange, currentWordLength))
 		end
 	end
 
 	-- ModuleScripts
+	duplicateModules = {}
 	local clientOnlyModules = CollectionService:GetTagged(CLIENT_ONLY_TAG)
 	for _, moduleScript in modules do
-		local skip = false
-
+		local moduleScriptName: string = moduleScript.Name
+		local neutralName: string = Transformers.asNeutralImportName(moduleScriptName)
+		
+		if moduleScript == currentScript or not string.find(string.lower(moduleScriptName), currentWord) then
+			continue
+		end
+		
 		if isInServerContext then
 			if moduleScript:HasTag(CLIENT_ONLY_TAG) then
-				skip = true
+				continue
 			else
+				local skip: boolean = false
 				for _, clientOnlyModule in clientOnlyModules do
 					if moduleScript:IsDescendantOf(clientOnlyModule) then 
 						skip = true 
 						break 
 					end
 				end
+				if skip then
+					continue
+				end
 			end
 		elseif moduleScript:IsDescendantOf(ServerScriptService) or moduleScript:IsDescendantOf(ServerStorage) then
-			skip = true
+			continue
 		end
-
-		if skip then continue end
-
-		local moduleScriptName = moduleScript.Name
-		if moduleScript ~= currentScript :: LuaSourceContainer and string.find(string.lower(moduleScriptName), currentWord) then
-			local duplicateIndex
-			if duplicateModules[moduleScriptName] then
-				duplicateIndex = #duplicateModules[moduleScriptName] + 1
-				table.insert(duplicateModules[moduleScriptName], moduleScript)
-			else
-				duplicateModules[moduleScriptName] = {}
+		
+		local duplicateIndex: number?
+		if duplicateModules[moduleScriptName] then
+			duplicateIndex = #duplicateModules[moduleScriptName] + 1
+			table.insert(duplicateModules[moduleScriptName], moduleScript)
+			
+			if alreadyImported[moduleScriptName .. "_" .. duplicateIndex :: number] or alreadyImported[neutralName .. "_" .. duplicateIndex :: number] then
+				continue
 			end
-
-			if table.find(alreadyImported, moduleScriptName) then continue end
-
-			table.insert(existingSuggestions.items, generateAutoCompleteSuggestion(moduleScript, locator.position :: Types.subRange, currentWordLength, duplicateIndex, currentScript))
+		else
+			duplicateModules[moduleScriptName] = {}
+			
+			if alreadyImported[moduleScriptName] or alreadyImported[neutralName] then
+				continue
+			end
 		end
+		
+		table.insert(existingSuggestions.items, generateAutoCompleteSuggestion(moduleScript, locator.position :: Types.subRange, currentWordLength, duplicateIndex, currentScript))
 	end
 
 	-- Instances
 	for _, instance in instances do
-		if table.find(alreadyImported, instance.Name) then continue end
-		if (instance:IsDescendantOf(ServerScriptService) or instance:IsDescendantOf(ServerStorage)) and not isInServerContext then continue end
+		if alreadyImported[instance.Name] then
+			continue
+		end
+		if (instance:IsDescendantOf(ServerScriptService) or instance:IsDescendantOf(ServerStorage)) and not isInServerContext then
+			continue
+		end
 
 		table.insert(existingSuggestions.items, generateAutoCompleteSuggestion(instance, locator.position :: Types.subRange, currentWordLength, nil, currentScript))
 	end
